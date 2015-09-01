@@ -10,6 +10,7 @@ module Keter.Main
 
 import qualified Codec.Archive.TempTarball as TempFolder
 import           Control.Concurrent.Async  (waitAny, withAsync)
+import           Control.Concurrent.MVar   (MVar, newMVar, readMVar, swapMVar)
 import           Control.Monad             (unless)
 import qualified Data.CaseInsensitive      as CI
 import qualified Data.Conduit.LogFile      as LogFile
@@ -59,16 +60,23 @@ import           Filesystem.Path.CurrentOS (encodeString)
 keter :: FilePath -- ^ root directory or config file
       -> [FilePath -> IO Plugin]
       -> IO ()
-keter input mkPlugins = withManagers input mkPlugins $ \kc hostman appMan log -> do
-    launchInitial kc appMan
-    startWatching kc appMan log
-    startListening kc hostman
+keter input mkPlugins = withManagers input mkPlugins $ \kcVar hostman appMan log -> do
+    watchConfig kcVar input
+    launchInitial kcVar appMan
+    startWatching kcVar appMan log
+    startListening kcVar hostman
 
 -- | Load up Keter config.
 withConfig :: FilePath
-           -> (KeterConfig -> IO a)
+           -> (MVar (KeterConfig) -> IO a)
            -> IO a
 withConfig input f = do
+    config <- makeConfig input
+    configVar <- newMVar config
+    f configVar
+
+makeConfig :: FilePath -> IO KeterConfig
+makeConfig input = do
     exists <- doesFileExist input
     config <-
         if exists
@@ -77,18 +85,26 @@ withConfig input f = do
                 case eres of
                     Left e -> throwIO $ InvalidKeterConfigFile input e
                     Right x -> return x
-            else return def { kconfigDir = input }
-    f config
+            else return $ def { kconfigDir = input }
+    return config 
+
+watchConfig :: MVar KeterConfig -> FilePath -> IO ()
+watchConfig configVar input = do
+    wm <- FSN.startManager
+    void $ FSN.watchTree wm (fromString input) (const True) $ \e -> do  --FIXME: RIGHT DIR not FILE
+        newConfig <- makeConfig input
+        void $ swapMVar configVar newConfig
 
 withLogger :: FilePath
-           -> (KeterConfig -> (LogMessage -> IO ()) -> IO a)
+           -> (MVar KeterConfig -> (LogMessage -> IO ()) -> IO a)
            -> IO a
-withLogger fp f = withConfig fp $ \config -> do
+withLogger fp f = withConfig fp $ \configVar -> do
+    config <- readMVar configVar
     mainlog <- LogFile.openRotatingLog
         (kconfigDir config </> "log" </> "keter")
         LogFile.defaultMaxTotal
 
-    f config $ \ml -> do
+    f configVar $ \ml -> do
         now <- getCurrentTime
         let bs = encodeUtf8 $ T.pack $ concat
                 [ take 22 $ show now
@@ -100,9 +116,10 @@ withLogger fp f = withConfig fp $ \config -> do
 
 withManagers :: FilePath
              -> [FilePath -> IO Plugin]
-             -> (KeterConfig -> HostMan.HostManager -> AppMan.AppManager -> (LogMessage -> IO ()) -> IO a)
+             -> (MVar KeterConfig -> HostMan.HostManager -> AppMan.AppManager -> (LogMessage -> IO ()) -> IO a)
              -> IO a
-withManagers input mkPlugins f = withLogger input $ \kc@KeterConfig {..} log -> do
+withManagers input mkPlugins f = withLogger input $ \configVar log -> do
+    kc@KeterConfig {..}  <- readMVar configVar
     processTracker <- initProcessTracker
     hostman <- HostMan.start
     portpool <- PortPool.start kconfigPortPool
@@ -131,10 +148,12 @@ withManagers input mkPlugins f = withLogger input $ \kc@KeterConfig {..} log -> 
             , ascKeterConfig = kc
             }
     appMan <- AppMan.initialize log appStartConfig
-    f kc hostman appMan log
+    f configVar hostman appMan log
 
-launchInitial :: KeterConfig -> AppMan.AppManager -> IO ()
-launchInitial kc@KeterConfig {..} appMan = do
+launchInitial :: MVar KeterConfig -> AppMan.AppManager -> IO ()
+launchInitial configVar appMan = do
+    kc@KeterConfig {..}  <- readMVar configVar
+    let incoming = getIncoming kc
     createDirectoryIfMissing True incoming
     bundles0 <- filter isKeter <$> listDirectoryTree incoming
     mapM_ (AppMan.addApp appMan) bundles0
@@ -143,8 +162,7 @@ launchInitial kc@KeterConfig {..} appMan = do
         appMan
         AIBuiltin
         (AppMan.Reload $ AIData $ BundleConfig kconfigBuiltinStanzas mempty)
-  where
-    incoming = getIncoming kc
+    
 
 getIncoming :: KeterConfig -> FilePath
 getIncoming kc = kconfigDir kc </> "incoming"
@@ -152,9 +170,11 @@ getIncoming kc = kconfigDir kc </> "incoming"
 isKeter :: FilePath -> Bool
 isKeter fp = takeExtension fp == ".keter"
 
-startWatching :: KeterConfig -> AppMan.AppManager -> (LogMessage -> IO ()) -> IO ()
-startWatching kc@KeterConfig {..} appMan log = do
+startWatching :: MVar KeterConfig -> AppMan.AppManager -> (LogMessage -> IO ()) -> IO ()
+startWatching configVar appMan log = do
     -- File system watching
+    kc@KeterConfig {..}  <- readMVar configVar
+    let incoming = getIncoming kc
     wm <- FSN.startManager
     _ <- FSN.watchTree wm (fromString incoming) (const True) $ \e -> do
         e' <-
@@ -178,10 +198,7 @@ startWatching kc@KeterConfig {..} appMan log = do
         newMap <- fmap Map.fromList $ forM bundles $ \bundle -> do
             time <- modificationTime <$> getFileStatus bundle
             return (getAppname bundle, (bundle, time))
-        AppMan.reloadAppList appMan newMap
-  where
-    incoming = getIncoming kc
-
+        AppMan.reloadAppList appMan newMap 
 
 -- compatibility with older versions of fsnotify which used
 -- 'Filesystem.Path'
@@ -206,8 +223,9 @@ listDirectoryTree fp = do
              return [fp1]
            ) (filter (\x -> x /= "." && x /= "..") dir)
 
-startListening :: KeterConfig -> HostMan.HostManager -> IO ()
-startListening KeterConfig {..} hostman = do
+startListening :: MVar KeterConfig -> HostMan.HostManager -> IO ()
+startListening configVar hostman = do
+    KeterConfig {..}  <- readMVar configVar
     manager <- HTTP.newManager HTTP.conduitManagerSettings
     runAndBlock kconfigListeners $ Proxy.reverseProxy
         kconfigIpFromHeader
